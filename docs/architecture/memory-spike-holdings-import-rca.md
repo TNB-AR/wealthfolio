@@ -4,10 +4,11 @@
 differing only in the snapshot year — `0224` reproduces the runaway/OOM, `2024` stays under
 200 MB. Fixes proposed (§4), not yet implemented. Awaiting the reporter's data only to confirm
 which mangling produced their bad date.
-**Last updated:** 2026-08-02
+**Last updated:** 2026-08-04 — re-verified against `feature/1347-performance-hotfix` @
+`1775193`, incorporating corrections from an independent static review (see §7).
 **Severity:** Critical — app becomes unusable, macOS kills the process
-**Affected area:** Holdings CSV import → post-import refresh (market sync + valuation
-recalculation)
+**Affected area:** Holdings import (CSV wizard, manual entry — desktop **and** web/server
+handlers) → post-import refresh (market sync + valuation recalculation)
 
 ---
 
@@ -43,33 +44,49 @@ into unbounded memory.
 
 ### 2.1 Primary: snapshot dates are format-validated but never range-validated
 
-- `check_holdings_import` (`apps/tauri/src/commands/portfolio.rs:1222-1228`) validates CSV
-  dates with `NaiveDate::parse_from_str(&snapshot.date, "%Y-%m-%d")` — **format only**. Years
-  `0224`, `1924`, `2924`, `9999` all parse successfully. There is no "not in the future" and no
-  lower-bound check.
-- The same gap exists in `save_manual_holdings` (`portfolio.rs:1085-1089`) and in
-  `ManualSnapshotService` / `SnapshotService::save_manual_snapshot`
-  (`crates/core/src/portfolio/snapshot/`): no path rejects an absurd `snapshot_date`.
+- `check_holdings_import` (`apps/tauri/src/commands/portfolio.rs`, ~line 1220 on the hotfix
+  branch) validates CSV dates with `NaiveDate::parse_from_str(&snapshot.date, "%Y-%m-%d")` —
+  **format only**. Years `0224`, `1924`, `2924`, `9999` all parse successfully. There is no
+  "not in the future" and no lower-bound check.
+- The same gap exists in `save_manual_holdings` (~1084) and `import_holdings_csv` (~1472), in
+  the **web/server handlers** (`apps/server/src/api/holdings/handlers.rs` ~682 — same
+  format-only pattern), and in `SnapshotService::save_manual_snapshot`
+  (`crates/core/src/portfolio/snapshot/snapshot_service.rs` ~1534): no path rejects an absurd
+  `snapshot_date`.
+- There is also **no database-level constraint**: `holdings_snapshots.snapshot_date` is
+  `DATE NOT NULL` with no `CHECK`, and **device-sync restore copies `holdings_snapshots` rows
+  directly between SQLite databases**
+  (`crates/storage-sqlite/src/sync/app_sync/repository.rs`, snapshot-restore path), bypassing
+  the service layer entirely. Write-side validation (F1) therefore cannot be the only defence —
+  a poisoned row can arrive via sync or pre-exist; the read-side clamp (F2) is the essential
+  containment layer.
 - Holdings CSV semantics make a single typo consequential: *"Rows with the same date form one
   snapshot; multiple dates create multiple snapshots"* (`portfolio.rs`, `import_holdings_csv`
   doc comment). **One mangled year in one of 51 hand-edited rows silently creates a second
   snapshot at that bogus date.** The import reports success — matching the reporter's "import
   was good".
 
-### 2.2 The valuation window is derived from stored dates, unclamped
+### 2.2 The valuation window start is derived from stored dates with no floor
 
-`get_daily_holdings_snapshots` (`crates/core/src/portfolio/snapshot/snapshot_service.rs:1221-1250`)
-derives the reconstruction window as:
+`get_daily_holdings_snapshots` (`crates/core/src/portfolio/snapshot/snapshot_service.rs`,
+~1395-1425 on the hotfix branch) derives the reconstruction window as:
 
 ```
-start = MIN(snapshot_date)                       -- no floor
-end   = MAX(snapshot_date).max(today)            -- no ceiling
+start = earliest non-synthetic snapshot_date              -- NO floor
+end   = (latest snapshot ≤ today+365 days).max(today)     -- effectively capped near today
 ```
 
-The only guard is `start > end → return empty`. A snapshot at year 0224 sets
-`start = 0224-07-20` (≈ 658,000 days to today); a snapshot at year 2924 sets
-`end = 2924` (≈ 328,000 days). Either poisons the window for **every subsequent
-recalculation** of that account.
+**Past dates are the OOM vector; far-future dates are not.** (Correction 2026-08-04 — an
+earlier revision of this document claimed `end = MAX(snapshot_date).max(today)` with no
+ceiling. That was wrong: the end-date lookup only considers snapshots up to `today + 365
+days`, so a year-2924/9999 snapshot is not found by it. A lone far-future snapshot yields
+empty/missing history, not a huge walk; a future date within 365 days extends the window by at
+most a year — benign. All measured reproductions used past dates and are unaffected by this
+correction.)
+
+A snapshot at year 0224 sets `start = 0224-07-20` (≈ 658,000 days to today) with only the
+`start > end → return empty` guard, and poisons the window for **every subsequent
+recalculation** of that account. The floor is the missing half; the ceiling effectively exists.
 
 ### 2.3 The pipeline materialises O(days × positions-in-poisoned-snapshot) in memory
 
@@ -80,7 +97,8 @@ For the poisoned window, `calculate_valuation_history`
 |---|---|---|
 | One deep-cloned `AccountStateSnapshot` **per calendar day** | `get_daily_holdings_snapshots`, `snapshot_service.rs:1313` | days × **positions carried on that day** (~400 B + map overhead per position) |
 | One forward-filled `Quote` struct (~6 heap `String`s) per asset per day — **but only from each ticker's first real quote onward** (`last_known_quotes` starts empty) | `fill_missing_quotes`, `crates/core/src/quotes/service.rs:2394-2435` | assets × real quote history (~300 MB for 51 tickers), **not** the poisoned window |
-| Per-day FX maps, per-day cloned quote maps, output valuation rows | `valuation_service.rs:342-379, 1838-1844` | bounded by quote-covered days |
+| Per-day FX rate maps | `fetch_fx_rates_for_range`, `valuation_service.rs` (~417 on the hotfix branch) | **walks the FULL poisoned range** (one BFS per day × currency pair + one map entry per day) for multi-currency accounts; empty for single-currency accounts (the USD-only repro exercised no FX cost) |
+| Per-day cloned quote maps, output valuation rows | `valuation_service.rs` (~1921) | bounded by quote-covered days |
 
 The dominant term is the per-day snapshot clone, and it scales with **how many positions the
 bad-dated snapshot carries** across the poisoned prefix (the pre-first-quote days are skipped
@@ -96,9 +114,9 @@ export/locale/spreadsheet reformat affecting every row identically), not a singl
 `fetch_fx_rates_for_range` additionally performs a graph BFS per (day × currency-pair), so the
 refresh also spins CPU — matching "application was trying to refresh data".
 
-### 2.4 Amplifier: the import triggers TWO concurrent full pipelines
+### 2.4 Amplifier: the import triggers TWO independent full pipelines (overlap likely, not guaranteed)
 
-A holdings import triggers the refresh twice, concurrently:
+A holdings import schedules the refresh twice, through two mechanisms that share no guard:
 
 1. `import_holdings_csv` / `save_manual_holdings` explicitly emit
    `PORTFOLIO_TRIGGER_RECALCULATE` (`portfolio.rs:1160-1170`) → `listeners.rs`
@@ -111,11 +129,16 @@ A holdings import triggers the refresh twice, concurrently:
    `run_portfolio_job` maps `None → Full` (`queue_worker.rs:317-324`). The queue worker's
    `is_processing` guard does not see pipeline (1).
 
-Two concurrent ~25 GB runs ≈ **~50 GB attempted** — the reported 44.9 GB is where macOS killed
-it. The double-trigger also explains why *sane* imports feel heavy (double market sync + double
-recalc), and the persistence of the poisoned snapshot explains the recurrence: every later
-import, and app startup's backfill check (`apps/tauri/src/lib.rs:188`), re-enters the poisoned
-account.
+Whether the two runs overlap depends on timing (the queue debounce is 1000 ms —
+`DEBOUNCE_MS`, `queue_worker.rs:39` — plus market-sync duration), so in the general case this
+is a *possible* ~2× amplifier, not a guaranteed one. **In the OOM scenario specifically,
+overlap is effectively certain:** the first pipeline's poisoned valuation walk runs for
+minutes-to-never, so the second trigger always lands while it is still allocating. One
+poisoned run is ~16 GB by itself; with overlap ~32 GB+ — the reported 44.9 GB is where macOS
+killed the process (macOS "App Memory" also counts compressed pages). The double-trigger also
+makes *sane* imports pay double (two market syncs + two Full recalcs), and the persistence of
+the poisoned snapshot explains the recurrence: every later import, and app startup's backfill
+check (`apps/tauri/src/lib.rs:188`), re-enters the poisoned account.
 
 ### 2.5 Verification status
 
@@ -180,36 +203,44 @@ accounts, or run:
 
 ## 4. Proposed Fixes
 
-In priority order. F1–F3 are small, independent patches; F4 is the structural fix tracked in
-the design document.
+In priority order (revised 2026-08-04: **F2 is now P0** — write-side validation cannot reach
+rows arriving via device-sync's direct table copy or already present in existing databases).
+F1–F3 are small, independent patches; F4 is the structural fix tracked in the design document.
+
+### F2 — Clamp the valuation window defensively (P0 — contains any bad date, from any source)
+
+In `get_daily_holdings_snapshots` (and the valuation range derivation), clamp the start to a
+floor and — because a 1900 floor alone still admits a ~46,000-day walk — enforce a **maximum
+reconstruction span / resource budget** (e.g., reject or truncate windows beyond ~N×10k days
+with a loud error) *before* allocating the date and snapshot vectors. **Log loudly** when a
+stored date falls outside the clamp instead of silently walking the range. This is the only
+layer that protects synced, restored, and pre-existing data.
 
 ### F1 — Range-validate snapshot dates at every write path (closes the door)
 
 Reject `snapshot_date > today` and `snapshot_date < 1900-01-01` (constant, with a clear user
-message) in:
-- `check_holdings_import` (surface as a per-row validation error in the wizard),
-- `import_holdings_csv` / `save_manual_holdings` (defence in depth at the command layer),
-- `SnapshotService::save_manual_snapshot` (covers broker import, device sync, and any future
-  caller).
+message). **Centralize the check in core** (`SnapshotService::save_manual_snapshot` /
+`ManualSnapshotService`) so desktop and web share it, then surface per-row errors in:
+- `check_holdings_import` (Tauri) and the equivalent web handler
+  (`apps/server/src/api/holdings/handlers.rs`) — wizard-level validation errors,
+- `import_holdings_csv` / `save_manual_holdings` — defence in depth at the command layer.
 
-### F2 — Clamp the valuation window defensively (contains any bad date)
-
-In `get_daily_holdings_snapshots` (and the valuation range derivation), clamp to
-`[max(earliest_snapshot, FLOOR), min(latest_snapshot, today)]` and **log loudly** when a stored
-date falls outside the clamp instead of silently walking the range. This protects against bad
-dates from *any* source, past or future, including pre-existing poisoned rows.
+Note: F1 does **not** cover device-sync restore, which copies `holdings_snapshots` rows
+directly at the storage layer, nor rows already in user databases — that is F2's job. A
+`CHECK` constraint on `snapshot_date` is worth considering alongside, with a data migration
+for existing offenders.
 
 ### F3 — Deduplicate the post-import trigger (halves every import's cost)
 
 Remove the explicit `emit_portfolio_trigger_recalculate` from `import_holdings_csv` and
-`save_manual_holdings` — the `HoldingsChanged` domain event already schedules the job through
-the guarded queue worker. Alternatively (or additionally), give `listeners.rs` the same
-`is_processing` guard so direct Tauri triggers and queue jobs cannot run the pipeline
-concurrently.
+`save_manual_holdings` and rely on the guarded domain-event queue job. Alternatively (or
+additionally), give `listeners.rs` the same `is_processing` guard so direct Tauri triggers and
+queue jobs cannot run the pipeline concurrently.
 
-Follow-on in the same area: the planner should map `HoldingsChanged` / `ManualSnapshotSaved` /
-`AccountsChanged` to a since-date (the snapshot/import date) instead of `None → Full`
-(`planner.rs:194-198`).
+Follow-on in the same area: add `earliest_snapshot_date` to `HoldingsChanged` (or consolidate
+it with `ManualSnapshotSaved`) so imports schedule `SinceDate` instead of `None → Full`
+(`planner.rs`). **Do not blanket-assign a since-date to `AccountsChanged`** — account deletion
+or currency changes can legitimately require a full rebuild.
 
 ### F4 — Structural: stop materialising O(days × assets) (design doc WS-B)
 
@@ -241,8 +272,14 @@ that makes the problem recur.
    normal immediately; (b) the diagnostic SQL from §2.5, or simply ask for their CSV's date
    column — if their bad snapshot carries all 51 positions, the last open item closes;
    (c) confirmation that a validation fix is planned.
-3. **Update #1347** — the sane-date portion of these findings (double trigger, O(days × assets)
-   materialisation) is the same mechanism behind that issue; F3 + F4 are the relevant fixes.
+3. **#1347 status (updated 2026-08-04):** partially addressed by
+   `feature/1347-performance-hotfix` @ `1775193`, which removed transfer-flow bottlenecks
+   (sparse market facts via `transfer_market_facts_for_activities` instead of range-filled
+   quote lookups) — so "all reports share one unchanged pipeline" is no longer precise. The
+   **core import valuation path remains dense** (`get_daily_holdings_snapshots` →
+   `get_quotes_in_range_filled` → per-day materialisation, `valuation_service.rs:1791-1921` on
+   that branch), so F4/WS-B still applies to it. PR #1218 and its follow-up (including the
+   storage-reclaim migration) are also merged on that branch.
 4. **Regression tests** alongside F1/F2: import wizard rejects out-of-range dates; valuation
    window stays clamped even with a hostile `snapshot_date` planted in the repository.
 
@@ -257,6 +294,39 @@ that makes the problem recur.
 - Direct user report (2026-07) — 44.9 GB spike on 51-ticker holdings CSV import; this RCA.
 - Controlled reproduction (2026-07/08, this RCA §2.5/§3) — control < 200 MB; single bad row
   2 GB; whole bad column → OOM. Root cause confirmed.
+- `feature/1347-performance-hotfix` @ `1775193` — transfer-flow bottleneck fixes for #1347;
+  PR #1218 + follow-up merged. Verified reference for this document's line numbers.
+
+---
+
+## 7. Review & Verification Log
+
+**2026-08-04 — independent static review, verified claim-by-claim against `1775193`.**
+An external review assessed this RCA against `feature/1347-performance-hotfix`. Every claim was
+re-checked in code; results:
+
+- **Accepted and applied:** the future-date claim was overstated (the end-date lookup caps at
+  `today + 365 days`; far-future dates yield empty history, past dates remain the vector —
+  §2.2 corrected); pipeline overlap is timing-dependent in general (§2.4 softened, with the
+  note that overlap is effectively certain in the OOM case because the first run never
+  completes); FX prefetch walks the full poisoned range for multi-currency accounts (§2.3
+  corrected — it was previously listed as quote-bounded); the same validation gap exists in the
+  **web/server handlers**, previously uncited (§2.1); device-sync restore bypasses the service
+  layer and there is no DB constraint, so F1 alone is insufficient and **F2 is promoted to P0**
+  with a max-span budget beyond the 1900 floor (§4); `AccountsChanged` should not be
+  blanket-assigned a since-date (§4/F3); the #1347 relationship is updated for the hotfix
+  branch (§5.3).
+- **Reviewer errata (minor):** the queue debounce is **1000 ms** (`DEBOUNCE_MS`,
+  `queue_worker.rs:39`) — the 500 ms figure comes from a stale doc comment in the same file;
+  and the FX full-range walk costs nothing for single-currency accounts (the USD-only repro),
+  which is why the measured repro numbers needed no revision.
+- **Repository hygiene:** this RCA and the companion design document live on the
+  `claude/valuation-calculations-performance-ii3pvr` branch, not on the hotfix branch the
+  reviewer examined — hence "missing from repository" from their vantage point. The
+  reproduction CSVs were session artifacts; they are now committed under
+  `docs/test-data/memory-repro/`.
+- **Unchanged:** all measured results (§2.5/§3) and the root-cause conclusion. The reviewer's
+  bottom line — F1/F2/F3 remain necessary, F2 first — matches this document's revised order.
 - [`valuation-performance-review-and-target-design.md`](./valuation-performance-review-and-target-design.md)
   — full architecture review; §2.2 (compute hot spots) and §4.3 (WS-B) are the structural
   context for F4.
